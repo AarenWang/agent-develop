@@ -2,65 +2,117 @@ import argparse
 import csv
 import re
 from pathlib import Path
+from textwrap import dedent
+
+import time
 
 import requests
-
-# --- 配置区 ---
-LLM_API_KEY = "你的_API_KEY"  # 支持 OpenAI 格式的 API (如 Claude, GPT, 或 DeepSeek)
-LLM_BASE_URL = "https://api.openai.com/v1"  # 或者你使用的中转地址
-MODEL_NAME = "gpt-4o"  # 建议使用长上下文模型
+from deep_translator import GoogleTranslator
 
 # Jina Reader 不需要 API Key 即可基础使用
 JINA_READER_URL = "https://r.jina.ai/"
-
-# --- 提示词库 ---
-PROMPTS = {
-    "cleaner": """你是一个专业的技术文档编辑，擅长从原始抓取文本中提取纯净的 Markdown 内容。
-处理文章标题《{article_title}》，来源 URL: {source_url}
-请严格执行：
-1. 仅保留正文内容，去除 Header/Footer、社交按钮、版权声明等噪声。
-2. 保留所有技术代码块、数学公式和图片占位符。
-3. 识别关键术语（如 MCP、ACI）并保留英文原文。""",
-
-    "translator": """你是一位资深 AI 架构师和技术翻译专家。
-当前文章标题《{article_title}》，来源 URL: {source_url}
-请将提供的 Markdown 翻译成中文并满足：
-1. 技术术语保持英文，并在括号中备注中文，例如 Agent-Computer Interface (ACI, 智能体-计算机接口)。
-2. 风格为信达雅，主动语态，专业且干练。
-3. 在复杂模式或关键设计段落后添加【深度解析】块，补充解释。""",
-
-    "rewriter": """你是一位顶尖技术博主。请对翻译后的内容进行重写和排版：
-文章标题：《{article_title}》
-来源 URL: {source_url}
-1. 文首增加“核心速览 (TL;DR)”，用要点概括全文。
-2. 使用粗体、列表、引用等 Markdown 语法优化视觉排版，保持信息层次清晰。
-3. 文末增加“下一步行动计划”，给出读者可执行的后续步骤。"""
-}
 
 
 def fetch_markdown(url):
     """使用 Jina Reader 抓取网页并转为 Markdown"""
     print(f"正在抓取网页: {url}")
-    response = requests.get(f"{JINA_READER_URL}{url}")
-    return response.text
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(f"{JINA_READER_URL}{url}")
+            response.raise_for_status()
+            return response.text
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            wait_time = 2 ** attempt
+            print(f"⚠️ 抓取失败（{exc}），{wait_time}s 后重试...")
+            time.sleep(wait_time)
+    raise last_error
 
 
-def call_llm(prompt, content):
-    """通用的 LLM 调用函数"""
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": content},
-        ],
-        "temperature": 0.3,
-    }
-    response = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload)
-    return response.json()["choices"][0]["message"]["content"]
+def clean_markdown(content: str) -> str:
+    """进行轻量清洗，移除冗余头信息并压缩空行"""
+    lines = []
+    for line in content.splitlines():
+        if line.startswith("Title:") or line.startswith("URL Source:"):
+            continue
+        lines.append(line.rstrip())
+
+    cleaned = []
+    for line in lines:
+        if line.strip() == "" and (cleaned and cleaned[-1] == ""):
+            continue
+        cleaned.append(line)
+
+    return "\n".join(cleaned).strip()
+
+
+def translate_markdown(content: str) -> str:
+    """翻译 Markdown 文本，保留代码块内容"""
+    translator = GoogleTranslator(source="auto", target="zh-CN")
+    segments = re.split(r"(```[\s\S]*?```)", content)
+    translated_parts = []
+
+    def _translate_chunk(text: str) -> str:
+        if len(text) <= 4500:
+            return translator.translate(text)
+        pieces = []
+        buffer = ""
+        for sentence in re.split(r"(?<=[。！!？?\n])", text):
+            if len(buffer) + len(sentence) > 4000 and buffer:
+                pieces.append(translator.translate(buffer))
+                buffer = ""
+            buffer += sentence
+        if buffer:
+            pieces.append(translator.translate(buffer))
+        return "".join(pieces)
+
+    for segment in segments:
+        if segment.startswith("```"):
+            translated_parts.append(segment)
+        elif segment.strip():
+            try:
+                translated_parts.append(_translate_chunk(segment))
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ 翻译失败，保留英文原文：{exc}")
+                translated_parts.append(segment)
+        else:
+            translated_parts.append(segment)
+
+    return "".join(translated_parts)
+
+
+def build_tldr(content: str, sentences: int = 3) -> str:
+    """从译文前几句生成简要 TL;DR"""
+    plain_text = re.sub(r"```[\s\S]*?```", "", content)
+    plain_text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", plain_text)
+    first_sentences = re.split(r"(?<=[。！!？?])", plain_text)
+    bullets = [s.strip() for s in first_sentences if s.strip()][:sentences]
+    if not bullets:
+        return "- 文章概览暂不可用"
+    return "\n".join(f"- {item}" for item in bullets)
+
+
+def rewrite_markdown(content: str, title: str, source_url: str) -> str:
+    """按照提示词要求进行重写排版"""
+    tldr_block = dedent(
+        f"""
+        ## 核心速览 (TL;DR)
+        {build_tldr(content)}
+        """
+    ).strip()
+
+    next_steps = dedent(
+        """
+        ## 下一步行动计划
+        - 选择一条思路在实践环境中试验，并记录结果。
+        - 将文中提到的最佳实践整理为团队规范。
+        - 对关键工具或接口进行 PoC 验证，确保集成可行性。
+        """
+    ).strip()
+
+    header = f"# {title}\n\n> 来源：{source_url}\n"
+    return "\n\n".join([header, tldr_block, content.strip(), next_steps])
 
 
 def slugify(title):
@@ -105,15 +157,15 @@ def process_article(url, title, output_dir):
 
         # 2. 清洗
         print("正在进行信息清洗...")
-        cleaned_md = call_llm(PROMPTS["cleaner"].format(article_title=title, source_url=url), raw_md)
+        cleaned_md = clean_markdown(raw_md)
 
         # 3. 翻译
         print("正在进行专家级翻译...")
-        translated_md = call_llm(PROMPTS["translator"].format(article_title=title, source_url=url), cleaned_md)
+        translated_md = translate_markdown(cleaned_md)
 
         # 4. 重构排版
         print("正在进行最终排版重构...")
-        final_md = call_llm(PROMPTS["rewriter"].format(article_title=title, source_url=url), translated_md)
+        final_md = rewrite_markdown(translated_md, title, url)
 
         # 保存结果
         output_filename = output_path / f"{slugify(title)}.md"
